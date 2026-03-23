@@ -1,0 +1,706 @@
+---
+name: iterate
+description: "Iterative multi-agent solve-and-review loop. Spawns 6 expert agents to solve the task defined in task.md using background.md context, then cross-pollinates, synthesizes, and reviews with specialized reviewers including adversarial red team and proof auditing. Loops until a solution passes all reviews or max iterations reached."
+allowed-tools:
+  - Agent
+  - Read
+  - Grep
+  - Glob
+  - Bash
+  - Write
+  - Edit
+  - WebSearch
+  - WebFetch
+model: opus
+user-invocable: true
+---
+
+# Iterative Multi-Agent Solve & Review
+
+You are orchestrating an iterative solve-and-review loop. Execute the phases below, repeating until a solution passes review or you reach **5 iterations**.
+
+## Setup: Load Context
+
+First, read all three input documents from the working directory:
+
+1. Read `background.md` — the domain background and problem context
+2. Read `task.md` — the specific task the experts must solve
+3. Read `review.md` — the acceptance criteria a solution must satisfy
+
+Also read any relevant source code, papers referenced in these documents, and links using WebFetch to build full context.
+
+## Phase 0a: Research Scouts (2-4 parallel agents)
+
+Before experts solve anything, launch scout agents to gather verified technical context. Each scout writes a briefing file that all experts will receive.
+
+Launch the following scouts in a **single message** so they run in parallel:
+
+### Scout 1: Paper Scout
+```
+You are a research scout. Your job is to read and summarize technical papers
+referenced in the problem so that experts have accurate, grounded context.
+
+## Task Overview
+{contents of task.md}
+
+## Background
+{contents of background.md}
+
+## Your Assignment
+Fetch and read the papers referenced in the background and task documents.
+For each paper, produce a detailed briefing covering:
+- The algorithm's core structure and key design decisions
+- Mathematical formulations (include exact equation numbers and section references)
+- Assumptions the algorithm makes
+- Limitations or open problems the authors acknowledge
+- Any details directly relevant to the task
+
+Focus on FACTS that will help experts produce correct solutions. Do not
+speculate or propose solutions yourself.
+
+Write your briefing to scout_paper.md.
+```
+
+### Scout 2: Code Scout
+```
+You are a code scout. Your job is to read the actual source code so that
+experts can reference real implementations rather than guessing.
+
+## Task Overview
+{contents of task.md}
+
+## Background
+{contents of background.md}
+
+## Your Assignment
+Read the source code in the working directory and any referenced repositories.
+Use Grep and Glob to find relevant files. Produce a briefing covering:
+- Key data structures (with file paths and line numbers)
+- Core algorithm implementation (the main loop, cost computation, heuristic)
+- Function signatures for all functions referenced in the task
+- Code snippets for sections that the solution would need to modify or extend
+- Build system and test infrastructure
+
+Include exact file paths, line numbers, and verbatim code snippets.
+Do not speculate or propose solutions.
+
+Write your briefing to scout_code.md.
+```
+
+### Scout 3: Domain Scout (optional — launch if the problem involves a well-studied field)
+```
+You are a domain scout. Your job is to search for related work and prior
+approaches to the problem class.
+
+## Task Overview
+{contents of task.md}
+
+## Background
+{contents of background.md}
+
+## Your Assignment
+Search for related work on the problem described in the task. Look for:
+- Prior approaches to this problem or closely related problems
+- Techniques from adjacent fields that could apply
+- Known impossibility results or lower bounds
+- Open problems in the area
+
+Use WebSearch to find relevant papers, blog posts, and discussions.
+Summarize what has been tried, what worked, what didn't, and what gaps remain.
+
+Write your briefing to scout_domain.md.
+```
+
+---
+
+## Phase 0b: Expert Persona Generation (inline)
+
+After loading all context and receiving scout briefings, design **exactly 6** expert personas tailored to the specific problem. Each expert must approach the task from a meaningfully different angle to maximize solution diversity.
+
+### How to generate personas
+
+1. **Analyze the domain**: Identify the primary field, key sub-disciplines, and what types of expertise are needed to solve the task.
+2. **Identify 6 complementary angles**: Choose perspectives that are distinct enough to produce different solution strategies, but all directly relevant.
+3. **For each expert, construct**:
+   - **Name & Title**: A concrete identity (e.g., "Dr. X, Senior Y at Z")
+   - **Specialty**: 1-2 sentences on their specific expertise relevant to this task
+   - **Angle**: What unique lens they bring — what will they focus on that the others won't?
+   - **Approach directives**: 3-5 bullet points telling this expert what to focus on
+   - **Output format**: 4-6 numbered sections structuring their solution document, tailored to their angle
+
+### Constraints on persona design
+
+- All 6 experts must be capable of producing a **complete solution** to the task, not just their slice of it. The angles shape their emphasis, not their scope.
+- At least one expert must focus on **formal correctness / theoretical rigor**.
+- At least one expert must focus on **concrete algorithms / implementation**.
+- At least one expert must focus on **edge cases, generality, and practical robustness**.
+- At least one expert must be an explicit **Skeptic/Adversary** — their primary directive is to identify why naive approaches fail (with counterexamples) before proposing a solution that survives their own attacks.
+- At least one expert must be a **Domain Outsider** — someone from an adjacent field (optimization theory, SAT/SMT, compiler design, auction theory, etc.) who brings non-obvious techniques and cross-domain analogies.
+- **No two experts may share the same core algorithmic approach.** If two experts would naturally use the same technique, force one to explore an alternative.
+- Personas must be informed by the actual content of `background.md`, `task.md`, and the scout briefings — do not generate generic personas.
+
+Output the 6 generated personas to the user before proceeding.
+
+---
+
+## Iteration Loop
+
+Set `iteration = 1`. Repeat the following phases until a solution passes review or `iteration > 5`.
+
+---
+
+### Phase 1: Expert Solve (6 parallel agents)
+
+Launch **exactly 6** Agent calls in a **single message** so they run in parallel. Each agent receives the scout briefings, full background, the task, and (if iteration > 1) the review feedback and ideas bank from previous iterations.
+
+Use the 6 expert personas generated in Phase 0b. For each expert, construct the agent prompt using this template:
+
+```
+You are {expert_name}, {expert_title}.
+
+Specialty: {expert_specialty}
+
+Your angle: {expert_angle}
+
+## Background
+{contents of background.md}
+
+## Research Briefings
+The following briefings were prepared by research scouts. Use them to ground
+your solution in verified facts. Reference real function names, line numbers,
+and equations — do not fabricate references.
+### Paper Briefing
+{contents of scout_paper.md}
+### Code Briefing
+{contents of scout_code.md}
+### Domain Briefing (if available)
+{contents of scout_domain.md}
+
+## Task
+{contents of task.md}
+
+{if iteration > 1:}
+## Previous Attempt Feedback
+The following review feedback was given on the last attempt. Address the
+issues listed under "Priority Fixes" while preserving everything listed
+under "What to Preserve":
+{previous_review_feedback}
+
+## Ideas Bank
+The following techniques and insights were identified as valuable across
+all expert solutions in previous iterations. Consider incorporating or
+building on these:
+{contents of ideas_bank.md}
+{end if}
+
+## Iteration Focus
+{iteration_focus_directive — see Phase 4 for the focus per iteration}
+
+## Your Approach
+{expert_approach_directives — the 3-5 bullet points from Phase 0b}
+
+## MANDATORY: Failure Mode Analysis
+Before presenting your solution, identify at least 2 approaches that DO NOT
+work and explain concretely why. For each failed approach:
+- Describe the approach in enough detail to evaluate
+- Construct a specific counterexample showing it fails
+- Explain what property is violated
+
+This demonstrates you have explored the solution space and is required for
+review acceptance.
+
+## MANDATORY: Worked Examples
+Your solution MUST include at least 3 concrete worked examples:
+1. A MINIMAL example (2-3 errors) showing the basic mechanism works
+2. A STRESS-TEST example with overlapping decompositions (shared components)
+3. An example from a DIFFERENT problem family than the first two (e.g., if
+   examples 1-2 use surface codes, example 3 must use color codes or bicycle codes)
+
+For each example, walk through EVERY step of the algorithm with concrete
+numbers. Do not hand-wave any step.
+
+## Output Format
+Produce a solution document with:
+{expert_output_format — the 4-6 numbered sections from Phase 0b}
+
+Write your solution to solution_{expert_shortname}_v{iteration}.md.
+```
+
+---
+
+### Phase 1.5: Cross-Pollination Debate (6 parallel agents)
+
+After all experts complete Phase 1, launch **exactly 6** Agent calls in a **single message**. Each expert reads ALL other experts' solutions and produces a revised version.
+
+```
+You are {expert_name}, {expert_title}. You previously produced a solution
+(attached below as "Your Original Solution"). You have now been given the
+solutions of all 5 other experts.
+
+## Your Original Solution
+{contents of solution_{expert_shortname}_v{iteration}.md}
+
+## Other Expert Solutions
+### Expert 2: {name}
+{contents of solution_{expert2}_v{iteration}.md}
+### Expert 3: {name}
+{contents of solution_{expert3}_v{iteration}.md}
+### Expert 4: {name}
+{contents of solution_{expert4}_v{iteration}.md}
+### Expert 5: {name}
+{contents of solution_{expert5}_v{iteration}.md}
+### Expert 6: {name}
+{contents of solution_{expert6}_v{iteration}.md}
+
+## Your Task
+
+### 1. STEAL GOOD IDEAS
+Identify the 2-3 best ideas from other solutions that your original solution
+lacks. For each:
+- What is the idea?
+- Which expert proposed it?
+- What does it add that your solution is missing?
+- How will you incorporate it?
+
+### 2. ATTACK WEAKNESSES
+For each of the 5 other solutions, identify the single biggest flaw.
+Construct a counterexample if possible. Be specific — "hand-waving" is not
+a useful critique; "this fails on DEM X because step Y produces Z instead
+of W" is.
+
+### 3. REVISE YOUR SOLUTION
+Produce an updated solution that:
+- Incorporates the best ideas from others
+- Addresses any weaknesses in your original that other experts' attacks revealed
+- Maintains your unique angle and approach
+
+### 4. DELTA SUMMARY
+At the top of your revised solution, list exactly what changed from your
+original and why.
+
+Write your revised solution to solution_{expert_shortname}_revised_v{iteration}.md.
+```
+
+---
+
+### Phase 2: Synthesis (1 agent)
+
+Launch **1** Agent that reads all 6 original solutions and all 6 revised solutions and produces a single synthesized solution.
+
+```
+You are a Master Synthesizer. Your expertise is combining the best elements
+of multiple solutions into a single superior solution that no individual
+expert could have produced alone.
+
+## Background
+{contents of background.md}
+
+## Task
+{contents of task.md}
+
+## Review Criteria
+{contents of review.md}
+
+## Research Briefings
+{contents of scout_paper.md, scout_code.md, scout_domain.md}
+
+## Expert Solutions (Original — 6 documents)
+{all 6 original solutions from Phase 1}
+
+## Expert Solutions (Revised after cross-pollination — 6 documents)
+{all 6 revised solutions from Phase 1.5}
+
+## Your Task
+
+### 1. TECHNIQUE INVENTORY
+List every distinct technique, algorithm, mechanism, or insight across all
+12 documents. For each:
+- **Technique**: What it is
+- **Source**: Which expert(s) proposed it
+- **Promise**: HIGH / MEDIUM / LOW
+- **Justification**: Why you rate it this way
+- **Counterexamples**: Any counterexamples found by other experts
+
+### 2. COMPATIBILITY ANALYSIS
+Identify which techniques can be combined and which are mutually exclusive.
+For conflicting techniques, explain the tradeoff and which you prefer.
+
+### 3. SYNTHESIZED SOLUTION
+Construct the single best solution by combining compatible high-promise
+techniques. Where experts disagree, resolve the disagreement with an
+explicit argument (not by fiat).
+
+The synthesized solution must:
+- Include all mandatory sections (Failure Mode Analysis, Worked Examples)
+- Reference real code locations from the Code Scout briefing
+- Include formal proofs where correctness claims are made
+- Address all edge cases raised by any expert
+
+### 4. PROVENANCE
+For each section of your synthesized solution, cite which expert(s)
+contributed the core idea. This ensures no expert's contribution is lost.
+
+Write the synthesized solution to solution_synthesized_v{iteration}.md.
+Write the technique inventory to ideas_bank.md (append if it already exists,
+preserving content from previous iterations).
+```
+
+---
+
+### Phase 3: Review (4 parallel agents)
+
+Launch **exactly 4** review agents in a **single message** that evaluate the synthesized solution. Each reviewer has a specialized focus.
+
+#### Reviewer 1: Criteria Reviewer
+```
+You are a rigorous reviewer evaluating a proposed solution.
+
+## Background
+{contents of background.md}
+
+## Review Criteria
+{contents of review.md}
+
+## Solution to Review
+{contents of solution_synthesized_v{iteration}.md}
+
+## Your Task
+Evaluate the solution against EACH criterion listed in the review document.
+For each criterion:
+
+1. **PASS** or **FAIL** — binary judgment
+2. **Severity** (if FAIL): CRITICAL / MAJOR / MINOR
+   - CRITICAL: Solution is fundamentally broken on this point
+   - MAJOR: Significant gap that undermines confidence
+   - MINOR: Improvement needed but solution is directionally correct
+3. **Evidence** — specific parts of the solution that support your judgment
+4. **Issues** — if FAIL, what specifically is wrong or missing
+
+Be rigorous. A solution that hand-waves correctness or makes unjustified
+claims should FAIL.
+
+## Output Format
+For each criterion in review.md, produce:
+
+### Criterion N: {criterion name}
+- **Verdict**: PASS/FAIL
+- **Severity**: (if FAIL) CRITICAL/MAJOR/MINOR
+- **Evidence**: ...
+- **Issues**: ...
+
+Then:
+### Strongest Aspects
+List 2-3 things the solution gets RIGHT that should NOT be changed in the
+next iteration. Be specific.
+
+### Overall Verdict: PASS/FAIL
+### Priority-Ordered Fix List (if FAIL):
+{All FAIL items ordered by severity (CRITICAL first), with specific,
+actionable instructions for the next iteration}
+```
+
+#### Reviewer 2: Completeness Reviewer
+```
+You are a reviewer focused on completeness, internal consistency, and
+practical feasibility.
+
+## Background
+{contents of background.md}
+
+## Review Criteria
+{contents of review.md}
+
+## Solution to Review
+{contents of solution_synthesized_v{iteration}.md}
+
+## Your Task
+Evaluate whether the solution is complete and internally sound:
+
+1. Are all necessary algorithms and methods fully specified (not hand-waved)?
+2. Are core mechanisms concretely defined with enough detail to implement?
+3. Are there gaps or logical leaps in the reasoning chain?
+4. Would someone with domain expertise have enough detail to implement this?
+5. Are edge cases and boundary conditions addressed?
+6. Are the worked examples correct and complete?
+
+## Output Format
+### Completeness Assessment
+- **Algorithm Specification**: PASS/FAIL — {details}
+- **Core Mechanism**: PASS/FAIL — {details}
+- **Logic Chain**: PASS/FAIL — {details}
+- **Implementability**: PASS/FAIL — {details}
+- **Edge Cases**: PASS/FAIL — {details}
+- **Worked Examples**: PASS/FAIL — {details}
+
+### Strongest Aspects
+List 2-3 things the solution gets RIGHT that should NOT be changed.
+
+### Overall Verdict: PASS/FAIL
+### Gaps to Address (if FAIL):
+{Specific items ordered by importance, with actionable instructions}
+```
+
+#### Reviewer 3: Adversarial Red Team
+```
+You are an adversarial reviewer. Your goal is to BREAK the proposed solution
+by constructing concrete counterexamples and stress-testing edge cases.
+
+## Background
+{contents of background.md}
+
+## Research Briefings
+{contents of scout_paper.md, scout_code.md}
+
+## Solution to Review
+{contents of solution_synthesized_v{iteration}.md}
+
+## Your Task
+For each major claim or mechanism in the solution:
+
+### 1. COUNTEREXAMPLE CONSTRUCTION
+Construct a specific, concrete input (e.g., a DEM with explicitly listed
+errors, detectors, probabilities, and decompositions) where the claim fails
+or the mechanism produces incorrect results. Show the step-by-step execution
+on your counterexample. If you cannot construct a counterexample after a
+genuine effort, state "SURVIVED — could not break" and explain what you tried.
+
+### 2. EDGE CASE STRESS TEST
+Determine if the solution handles these specific scenarios (construct
+concrete examples for each):
+- A component that participates in 5+ composite structures simultaneously
+- A composite whose discount exceeds all its component weights combined
+- Two composites that share ALL components (complete overlap)
+- A path where the same component appears 3+ times (multiset)
+- Zero-weight or near-zero-weight components
+- A conflict graph component with 25+ vertices
+- A component whose partition is a subset of another's partition
+
+### 3. PROOF ATTACK
+For each proof in the solution, attempt to find a gap:
+- Are all assumptions stated explicitly?
+- Does each step follow logically from the previous?
+- Are there hidden assumptions about input properties?
+- Does the proof work for arbitrary input topologies?
+- Check quantifier correctness (for all vs. there exists)
+
+## Output Format
+For each attack:
+### Attack N: {target claim}
+- **Counterexample**: {concrete input and execution trace}
+- **Result**: SURVIVED / BROKEN
+- **If BROKEN**: {what specifically fails and why}
+
+### Overall Assessment: SURVIVES / HAS VULNERABILITIES
+### Vulnerabilities Found (ordered by severity):
+{list with severity and specific fix suggestions}
+```
+
+#### Reviewer 4: Blind Spots Auditor
+```
+You are a blind spots auditor. Your job is to identify what EVERY expert
+missed — shared assumptions, unexplored approaches, and unstated constraints.
+
+## Background
+{contents of background.md}
+
+## Task
+{contents of task.md}
+
+## Ideas Bank (techniques attempted so far)
+{contents of ideas_bank.md}
+
+## Synthesized Solution
+{contents of solution_synthesized_v{iteration}.md}
+
+## Your Task
+
+### 1. SHARED ASSUMPTIONS
+What assumptions do ALL experts make? Are any wrong or unnecessarily
+restrictive? For each assumption:
+- State the assumption explicitly
+- Assess whether it is justified
+- If unjustified, what happens when it is violated?
+
+### 2. UNEXPLORED APPROACHES
+What solution strategies did NOBODY try? Consider techniques from:
+LP relaxation, ILP, constraint propagation, lazy evaluation, memoization,
+branch-and-bound alternatives, approximation algorithms with provable
+guarantees, randomized approaches, and any domain-specific techniques
+from the scout briefings.
+
+For each unexplored approach, briefly assess feasibility and potential.
+
+### 3. GENERALITY GAPS
+Does the solution actually work for all input types mentioned in the review
+criteria, or does it implicitly assume properties specific to one type?
+
+### 4. SCALABILITY CONCERNS
+What happens at large scale? Are there exponential steps hiding behind
+"small in practice" claims? Identify any complexity concerns.
+
+## Output
+### Shared Assumptions (with risk assessment)
+### Unexplored Approaches (with feasibility assessment)
+### Generality Gaps
+### Scalability Concerns
+### Verdict: PASS / NEEDS ATTENTION
+```
+
+---
+
+### Phase 3.5: Proof Auditor (1 agent)
+
+If the synthesized solution contains mathematical proofs, theorems, or formal claims, launch **1** Agent for dedicated proof auditing.
+
+```
+You are a mathematical proof auditor. You specialize in verifying formal
+arguments in algorithm design and combinatorial optimization.
+
+## Solution
+{contents of solution_synthesized_v{iteration}.md}
+
+## Research Briefings (for reference)
+{contents of scout_paper.md}
+
+## Your Task
+For EVERY theorem, lemma, corollary, claim, and proof in the document:
+
+1. **Restate** the claim formally (if not already formal)
+2. **List** all premises and assumptions (both stated and implicit)
+3. **Walk through** each proof step. For each step:
+   - Does it follow from previous steps or stated assumptions?
+   - Is the logical inference valid?
+   - Are there any quantifier errors (for all vs. there exists)?
+   - Are set operations correct (union vs. disjoint union, intersection, etc.)?
+4. **Check boundary cases**:
+   - Does the proof work when sets are empty?
+   - Does the proof work at extreme parameter values (0, 1, infinity)?
+   - Does the proof work for degenerate inputs (single element, all identical)?
+5. **Verdict** per proof: VERIFIED / GAP FOUND / ERROR FOUND
+
+If GAP FOUND or ERROR FOUND: describe exactly what is missing or wrong, and
+suggest how to fix it.
+
+## Output Format
+For each proof:
+### Proof: {theorem/lemma name}
+- **Claim**: {formal restatement}
+- **Premises**: {numbered list}
+- **Step-by-step audit**: {each step with status}
+- **Boundary cases**: {each case checked}
+- **Verdict**: VERIFIED / GAP: {description} / ERROR: {description}
+
+### Overall: ALL VERIFIED / ISSUES FOUND
+### Issues Summary (if any):
+{list of gaps and errors with suggested fixes}
+```
+
+If the solution contains no mathematical proofs, skip this phase.
+
+---
+
+### Phase 4: Verdict (inline)
+
+After all reviewers and the proof auditor complete, determine the overall verdict.
+
+#### Acceptance criteria
+
+**ACCEPT** if ALL of the following hold:
+- Criteria Reviewer: PASS (no CRITICAL or MAJOR failures)
+- Completeness Reviewer: PASS
+- Adversarial Red Team: SURVIVES (no BROKEN attacks)
+- Blind Spots Auditor: PASS
+- Proof Auditor: ALL VERIFIED (or skipped if no proofs)
+
+If accepted, proceed to Phase 5 (Solution Tournament).
+
+#### If any reviewer found issues
+
+Collect all feedback and construct the iteration feedback package:
+
+1. **What to Preserve**: Merge the "Strongest Aspects" lists from all reviewers. These are things the next iteration MUST NOT change.
+2. **Priority Fixes**: Merge all failure items, ordered by severity (CRITICAL → MAJOR → MINOR). Include specific fix instructions.
+3. **Red Team Vulnerabilities**: Include any BROKEN counterexamples with full execution traces.
+4. **Blind Spots**: Include any NEEDS ATTENTION items.
+5. **Proof Issues**: Include any GAP FOUND or ERROR FOUND items with suggested fixes.
+
+#### Progressive deepening focus
+
+Each iteration receives a focus directive that shapes expert attention:
+- **Iteration 1**: Focus on **correctness and formal proofs**. Get the core algorithm right.
+- **Iteration 2**: Focus on **edge cases, counterexamples, and generality**. Stress-test what iteration 1 produced.
+- **Iteration 3**: Focus on **implementation specificity and code-level detail**. Ground the solution in real code.
+- **Iteration 4**: Focus on **scalability and practical performance**. Address complexity concerns.
+- **Iteration 5**: Focus on **final polish and completeness**. Close every remaining gap.
+
+Increment `iteration` and return to Phase 1. Briefly summarize for the user:
+- Which reviewers failed and why
+- Key vulnerabilities found by Red Team
+- The focus directive for the next iteration
+- What iteration you're starting
+
+---
+
+### Phase 5: Solution Tournament (3 parallel agents — post-acceptance only)
+
+After a solution passes all reviews, run a final tournament to confirm the synthesized solution is genuinely the best.
+
+Launch **3** Agent calls in a **single message**. Each compares the accepted synthesized solution against the 2 strongest non-winning expert revised solutions.
+
+```
+You are a solution comparator. You must determine which solution is
+objectively superior by careful analysis, not by default or bias.
+
+## Background
+{contents of background.md}
+
+## Review Criteria
+{contents of review.md}
+
+## Solution A (Accepted Synthesis)
+{contents of solution_synthesized_v{iteration}.md}
+
+## Solution B (Challenger: {expert_name})
+{contents of solution_{expert_shortname}_revised_v{iteration}.md}
+
+## Your Task
+Compare on each dimension:
+1. **Correctness**: Formal proofs, guarantees, counterexample survival
+2. **Generality**: Independence from specific input types
+3. **Implementability**: How close to real code, references to actual functions
+4. **Edge case coverage**: Breadth and depth of worked examples
+5. **Elegance / simplicity**: Fewer moving parts, cleaner design
+
+For each dimension, declare a winner (A or B) with specific justification.
+
+### Overall Winner: A or B
+### Confidence: HIGH / MEDIUM / LOW
+### Key Differentiator: {the single most important reason}
+
+If B wins with HIGH confidence, explain exactly what A is missing that B
+provides, so the orchestrator can consider re-evaluation.
+```
+
+After the tournament:
+- If all 3 comparators confirm A (the synthesis) wins, or wins with MEDIUM+ confidence: **write `solution_final.md`** and stop.
+- If any comparator says B wins with HIGH confidence: report to the user with the specific differentiator and ask whether to accept the synthesis or incorporate the challenger's approach.
+
+---
+
+## If Max Iterations Reached
+
+If you reach iteration 5 without a passing solution:
+1. Write the best solution so far to `solution_best_effort.md`
+2. Write a summary of all review feedback across iterations to `review_history.md`
+3. Write the final `ideas_bank.md` with the complete technique inventory
+4. Tell the user which criteria remain unsatisfied, what the Red Team broke, and suggest next steps
+
+## Important Notes
+
+- Always write solution files so progress is preserved even if the session is interrupted
+- Each iteration's experts should build on previous feedback and the ideas bank, not start from scratch
+- The review must be strict — a weak pass now means a flawed solution downstream
+- When source code or papers are referenced in the input documents, read them to ground solutions in reality
+- The cross-pollination phase is critical — do not skip it even if one expert's solution seems clearly best
+- The ideas_bank.md is a living document — append to it each iteration, never overwrite previous content
+- Scout briefings are created once (before iteration 1) and reused across all iterations
